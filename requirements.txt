@@ -1,0 +1,9 @@
+torch
+requests
+bs4
+pandas
+tqdm
+numpy
+scikit-learn
+torch-geometric
+urllib3

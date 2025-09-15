@@ -14,6 +14,7 @@ import warnings
 import torch.nn as nn
 import time
 
+# Optional GPU memory cap (uncomment to enable)
 # if torch.cuda.is_available():
 #     torch.cuda.set_per_process_memory_fraction(0.2)
 
@@ -50,18 +51,17 @@ def setup_logging(script_name):
 
 def collate_preprocessed_graphs(batch):
     """
-    Custom collate function for pre-processed (windowed) graphs.
-    A batch item is a tuple: (list_of_windows, label).
+    Collate function for pre-windowed graphs.
+    Each batch item: (list_of_windows, label).
+    Returns: (window_batch, graph_window_indices, labels, num_graphs)
     """
     all_windows = [item for sublist in [b[0] for b in batch] for item in sublist]
     labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
     
-    # Create a mapping from each window back to its original graph in the batch
     graph_window_indices = []
     for i, (windows, _) in enumerate(batch):
         graph_window_indices.extend([i] * len(windows))
         
-    # Batch all windows together for efficient processing
     window_batch = Batch.from_data_list(all_windows)
     
     return window_batch, torch.tensor(graph_window_indices), labels, len(batch)
@@ -79,7 +79,7 @@ def train_model(train_loader, test_loader, model, config):
         optimizer, T_0=10, T_mult=2, eta_min=lr/20
     )
 
-    # Check for pre-calculated weights in config, otherwise calculate them
+    # Use provided class weights or compute from training data
     if 'class_weights' in config and config['class_weights'] is not None:
         class_weights = config['class_weights']
     else:
@@ -108,10 +108,7 @@ def train_model(train_loader, test_loader, model, config):
             labels = labels.to(device)
             
             optimizer.zero_grad()
-            
             outputs = model(window_batch, graph_window_indices, num_graphs)
-            
-            # Calculate loss and perform backpropagation
             loss = criterion(outputs, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -173,7 +170,6 @@ def evaluate_model(model, loader, device):
             labels = labels.to(device)
             
             start_time = time.time()
-            # Model now returns attention weights during eval
             outputs, attn_weights = model(window_batch, graph_window_indices, num_graphs)
             total_inference_time += time.time() - start_time
             
@@ -214,7 +210,6 @@ def evaluate_model(model, loader, device):
 def _calculate_class_weights(train_loader, device, is_preprocessed=True):
     """Calculate class weights for balanced training on preprocessed data."""
     class_counts = torch.zeros(2)
-    # The new loader item is (window_batch, graph_window_indices, labels, num_graphs)
     for _, _, labels, _ in train_loader:
         for i in range(2):
             class_counts[i] += (labels == i).sum().item()
@@ -224,7 +219,7 @@ def _calculate_class_weights(train_loader, device, is_preprocessed=True):
 
 
 def _initialize_history():
-    """Initialize training history dictionary"""
+    """Initialize training history dictionary."""
     return {
         'train_loss': [], 'train_accuracy': [], 'train_precision': [], 'train_recall': [], 'train_f1': [],
         'test_accuracy': [], 'test_precision': [], 'test_recall': [], 'test_f1': [], 'lr': []
@@ -232,14 +227,13 @@ def _initialize_history():
 
 
 def run_letagnn_training(homo_graphs, args):
-    """Run LETAGNN training with 5-fold cross-validation"""
+    """Run LETAGNN training with 5-fold cross-validation."""
     set_seed(args.seed)
     device = args.device
     
-    # Correct Order: 1. Normalize -> 2. Window
+    # Normalize then window
     homo_graphs = normalize_features(homo_graphs)
 
-    # --- Pre-process all graphs into windows before training ---
     logging.info("Preprocessing all graphs into windows...")
     preprocessed_graphs = []
     for graph in tqdm(homo_graphs, desc="Windowing graphs"):
@@ -261,7 +255,6 @@ def run_letagnn_training(homo_graphs, args):
         train_loader = DataLoader(train_data, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, collate_fn=collate_preprocessed_graphs)
         test_loader = DataLoader(test_data, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_preprocessed_graphs)
         
-        # Determine feature dimensions from the first window of the first graph
         first_window = preprocessed_graphs[0][0][0]
         in_channels = first_window.x.size(1)
         edge_dim = first_window.edge_attr.size(1) if first_window.edge_attr is not None else 0
@@ -286,18 +279,14 @@ def run_letagnn_training(homo_graphs, args):
         }
         model, history, inference_time = train_model(train_loader, test_loader, model, train_config)
         
-        # --- Save Attention Weights ---
         logging.info("Evaluating final model to get attention weights...")
         test_metrics, attention_weights = evaluate_model(model, test_loader, device)
         
-        # Map graph indices back to original addresses or use index as fallback
         for aw in attention_weights:
             original_graph_idx = test_idx[aw['graph_index']]
             try:
-                # Prefer address if it exists
                 aw['identifier'] = homo_graphs[original_graph_idx].address
             except AttributeError:
-                # Fallback to using the graph index as a unique ID
                 aw['identifier'] = f"graph_index_{original_graph_idx}"
         
         weights_save_path = f"logs/attention_weights_{args.dataset}_fold{fold+1}.pkl"
@@ -362,24 +351,20 @@ def run_letagnn_training(homo_graphs, args):
 def main():
     """Run LETAGNN training across all specified datasets."""
     parser = argparse.ArgumentParser(description='LETAGNN Training with Temporal Window Attention')
-    parser.add_argument('--epochs', type=int, default=51,
-                        help='Number of training epochs')
-    parser.add_argument('--seed', type=int, default=24,
-                        help='Random seed for reproducibility')
-    parser.add_argument('--gpu', type=int, default=0, choices=[0, 1, 2, 3],
-                        help='GPU device number to use (0-3)')
+    parser.add_argument('--epochs', type=int, default=51, help='Number of training epochs')
+    parser.add_argument('--seed', type=int, default=24, help='Random seed')
+    parser.add_argument('--gpu', type=int, default=0, choices=[0, 1, 2, 3], help='GPU device to use')
     args = parser.parse_args()
 
-    # Setup a single log file for the entire run
     setup_logging('TrainLETA')
 
     datasets = ['2DynEth', 'Meta', 'ZipZap']
     all_results = []
     
     homo_graphs_paths = {
-        '2DynEth': "Dataset/PhishCombine/graphs_home/homo_2DynEth_graphs.pkl",
-        'Meta': "Dataset/PhishCombine/graphs_home/homo_Meta_graphs.pkl", 
-        'ZipZap': "Dataset/PhishCombine/graphs_home/homo_ZipZap_graphs.pkl"
+        '2DynEth': "Dataset/graphs_home/homo_2DynEth_graphs.pkl",
+        'Meta': "Dataset/graphs_home/homo_Meta_graphs.pkl", 
+        'ZipZap': "Dataset/graphs_home/homo_ZipZap_graphs.pkl"
     }
     
     for dataset_name in datasets:
@@ -392,7 +377,7 @@ def main():
         with open(homo_graphs_paths[dataset_name], 'rb') as f:
             homo_graphs = pickle.load(f)
 
-        # Clean up graph attributes to keep only essential ones
+        # Keep only essential attributes
         for graph in homo_graphs:
             standard_attrs = {'x', 'edge_index', 'edge_attr', 'y', 'edge_times_normalized', 'address'}
             current_attrs = set(graph.keys())
@@ -413,19 +398,16 @@ def main():
         else:
             logging.error(f"Training failed for dataset {dataset_name}.")
 
-    # --- Save all results to a single CSV file ---
     if all_results:
         results_file = "logs/letagnn_results.csv"
         df_final = pd.DataFrame(all_results)
         
-        # Format results for readability
         df_final['F1-Score'] = df_final.apply(lambda r: f"{r['avg_best_test_f1']*100:.2f}±{r['std_best_test_f1']*100:.2f}", axis=1)
         df_final['Precision'] = df_final.apply(lambda r: f"{r['avg_best_test_precision']*100:.2f}±{r['std_best_test_precision']*100:.2f}", axis=1)
         df_final['Recall'] = df_final.apply(lambda r: f"{r['avg_best_test_recall']*100:.2f}±{r['std_best_test_recall']*100:.2f}", axis=1)
         df_final['Accuracy'] = df_final.apply(lambda r: f"{r['avg_best_test_accuracy']*100:.2f}±{r['std_best_test_accuracy']*100:.2f}", axis=1)
         df_final['Inference Time (ms)'] = df_final.apply(lambda r: f"{r['avg_inference_time_s']*1000:.4f}±{r['std_inference_time_s']*1000:.4f}", axis=1)
 
-        # Select and reorder columns
         final_columns = ['dataset', 'F1-Score', 'Precision', 'Recall', 'Accuracy', 'avg_best_epoch', 'Inference Time (ms)']
         df_to_save = df_final[final_columns]
         

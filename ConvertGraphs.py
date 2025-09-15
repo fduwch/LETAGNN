@@ -1,6 +1,6 @@
 """
-简单的异构图到同构图转换工具
-从graphs_Meta文件夹读取异构图，转换后保存到graphs_Meta_home文件夹
+Simple tool to convert heterogeneous graphs to homogeneous graphs.
+Reads from `graphs_Meta` and writes to `graphs_Meta_home`.
 """
 
 import torch
@@ -9,8 +9,7 @@ import pickle
 from tqdm import tqdm
 from torch_geometric.data import Data
 
-# Local implementation to load all graph files from a directory
-# Returns (graphs, labels)
+# Load all .pt graph files from a directory and return (graphs, labels)
 def load_graph_files(input_dir, max_file_size_mb=80):
     graphs = []
     labels = []
@@ -34,18 +33,19 @@ def load_graph_files(input_dir, max_file_size_mb=80):
                     labels.append(0)
     return graphs, labels
 
+
 def convert_hetero_to_homo(hetero_graph, label):
-    """将异构图转换为同构图"""
+    """Convert a heterogeneous graph to a homogeneous graph."""
     node_features, edge_indices, edge_attr = [], [], []
     node_count = 0
     node_map = {}
     
-    # 处理所有节点
+    # Nodes
     for node_type in hetero_graph.node_types:
         if hasattr(hetero_graph[node_type], 'x') and hetero_graph[node_type].x is not None:
             num_nodes = hetero_graph[node_type].x.size(0)
             
-            # 包含节点类型指示器
+            # Node type one-hot indicator
             type_indicator = torch.zeros(num_nodes, len(hetero_graph.node_types))
             type_idx = list(hetero_graph.node_types).index(node_type)
             type_indicator[:, type_idx] = 1
@@ -55,14 +55,14 @@ def convert_hetero_to_homo(hetero_graph, label):
             else:
                 node_feat = type_indicator
             
-            # 保存节点映射
+            # Map (type, local_idx) -> global_idx
             for i in range(num_nodes):
                 node_map[(node_type, i)] = node_count + i
             
             node_count += num_nodes
             node_features.append(node_feat)
     
-    # 合并所有节点特征
+    # Concatenate and pad node features to the same dim
     if node_features:
         max_dim = max(feat.size(1) for feat in node_features)
         padded_features = []
@@ -76,16 +76,16 @@ def convert_hetero_to_homo(hetero_graph, label):
     else:
         all_features = torch.zeros(node_count, 1)
     
-    # 处理所有边 - 只看关系类型，不区分源目标节点类型
+    # Edges (aggregate by relation type only)
     edge_times = []
     relation_types = set()
     
-    # 首先收集所有唯一的关系类型
+    # Collect unique relation types
     for edge_type in hetero_graph.edge_types:
         src_type, rel_type, dst_type = edge_type
         relation_types.add(rel_type)
     
-    relation_types = sorted(list(relation_types))  # 保证顺序一致
+    relation_types = sorted(list(relation_types))
     
     for edge_type in hetero_graph.edge_types:
         if hasattr(hetero_graph[edge_type], 'edge_index'):
@@ -101,11 +101,11 @@ def convert_hetero_to_homo(hetero_graph, label):
                     new_dst_idx = node_map[(dst_type, dst_idx)]
                     edge_indices.append(torch.tensor([[new_src_idx], [new_dst_idx]]))
                     
-                    # 提取边特征
+                    # Edge features
                     if hasattr(hetero_graph[edge_type], 'edge_attr') and hetero_graph[edge_type].edge_attr is not None:
                         edge_feature = hetero_graph[edge_type].edge_attr[i]
                         
-                        # 只基于关系类型编码，不考虑源目标节点类型
+                        # Relation one-hot
                         relation_onehot = torch.zeros(len(relation_types))
                         relation_idx = relation_types.index(rel_type)
                         relation_onehot[relation_idx] = 1
@@ -115,13 +115,13 @@ def convert_hetero_to_homo(hetero_graph, label):
                         else:
                             edge_feat = relation_onehot
                         
-                        # 提取时间戳
+                        # Timestamp (5th feature if available)
                         edge_times.append(edge_feature[4].item() if edge_feature.size(0) > 4 else 0.0)
                         edge_attr.append(edge_feat.unsqueeze(0))
                     else:
                         edge_times.append(0.0)
     
-    # 创建同构图
+    # Build homogeneous graph
     if edge_indices:
         all_edge_indices = torch.cat(edge_indices, dim=1)
         
@@ -145,24 +145,20 @@ def convert_hetero_to_homo(hetero_graph, label):
             y=torch.tensor([label], dtype=torch.long)
         )
         
-        # Save feature dimension info for ablation
+        # Keep minimal but useful metadata
         homo_graph.original_node_feat_dim = hetero_graph[list(hetero_graph.node_types)[0]].x.size(1) if len(hetero_graph.node_types) > 0 and hasattr(hetero_graph[list(hetero_graph.node_types)[0]], 'x') else 0
         homo_graph.node_type_feat_dim = len(hetero_graph.node_types)
-        homo_graph.original_edge_feat_dim = 5  # Assuming 5 original edge features
+        homo_graph.original_edge_feat_dim = 5
         homo_graph.edge_type_feat_dim = len(relation_types)
         
-        # 添加时间信息
         if edge_times:
             homo_graph.edge_times = torch.tensor(edge_times, dtype=torch.float)
-            # 不再归一化时间，edge_times_normalized仅为占位
             homo_graph.edge_times_normalized = torch.zeros(len(edge_times), dtype=torch.float)
         else:
-            # Ensure all graphs have edge_times attributes
             num_edges = homo_graph.edge_index.size(1)
             homo_graph.edge_times = torch.zeros(num_edges, dtype=torch.float)
             homo_graph.edge_times_normalized = torch.zeros(num_edges, dtype=torch.float)
         
-        # Add basic temporal attributes for consistent batching
         homo_graph.is_multi_temporal = False
         homo_graph.num_temporal_windows = 1
         
@@ -170,40 +166,38 @@ def convert_hetero_to_homo(hetero_graph, label):
     
     return None
 
+
 def main():
     input_dir = "Dataset/PhishCombine/graphs_2DynEth"
     output_dir = "Dataset/PhishCombine/graphs_home"
     output_file = os.path.join(output_dir, "homo_2DynEth_graphs.pkl")
     
-    print("开始转换异构图到同构图...")
-    print(f"输入目录: {input_dir}")
-    print(f"输出目录: {output_dir}")
+    print("Converting heterogeneous graphs to homogeneous graphs...")
+    print(f"Input directory: {input_dir}")
+    print(f"Output directory: {output_dir}")
     
-    # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
     
-    # 加载异构图
-    print("加载异构图数据...")
+    print("Loading heterogeneous graphs...")
     hetero_graphs, labels = load_graph_files(input_dir, max_file_size_mb=80)
-    print(f"加载了 {len(hetero_graphs)} 个异构图")
+    print(f"Loaded {len(hetero_graphs)} heterogeneous graphs")
     
-    # 转换为同构图
     homo_graphs = []
-    print("转换中...")
-    for idx, hetero_graph in enumerate(tqdm(hetero_graphs, desc="转换进度")):
+    print("Converting...")
+    for idx, hetero_graph in enumerate(tqdm(hetero_graphs, desc="Converting")):
         homo_graph = convert_hetero_to_homo(hetero_graph, labels[idx])
         if homo_graph is not None:
             homo_graphs.append(homo_graph)
     
-    print(f"成功转换 {len(homo_graphs)} 个同构图")
+    print(f"Successfully converted {len(homo_graphs)} homogeneous graphs")
     
-    # 保存到单个文件
-    print(f"保存到文件: {output_file}")
+    print(f"Saving to: {output_file}")
     with open(output_file, 'wb') as f:
         pickle.dump(homo_graphs, f)
     
-    print("转换完成!")
-    print(f"结果保存在: {output_file}")
+    print("Done!")
+    print(f"Results saved at: {output_file}")
+
 
 if __name__ == "__main__":
     main() 

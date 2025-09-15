@@ -15,7 +15,7 @@ This will install all necessary dependencies for running the scripts.
 To run the code, follow these steps:
 
 1. **Download the Pre-built Label-Enhanced Graph Dataset**
-   - You can download the dataset from OneDrive (link to be provided).
+   - You can download the dataset from OneDrive (https://1drv.ms/f/c/cdc0f83bf736d892/EpAFMmHdQrxLuN5zcStBc_ABQZZGcasSHpjmCnWNs2n4Tg?e=04Et3Q).
 
    **OR**
 

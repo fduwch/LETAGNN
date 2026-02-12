@@ -96,12 +96,12 @@ The main training entry point is `TrainLETA.py`, which runs 5-fold cross-validat
 Basic usage:
 
 ```bash
-python TrainLETA.py --epochs 51 --seed 42 --gpu 0
+python TrainLETA.py --epochs 30 --seed 42 --gpu 0
 ```
 
 Key options:
 
-- `--epochs`: number of training epochs (default: 51)
+- `--epochs`: number of training epochs (default: 30)
 - `--seed`: random seed (default: 42)
 - `--gpu`: GPU id, e.g. `0`
 - `--light-window`: use `LETAGNN_LightWindow` (full-graph encoder + light temporal branch)

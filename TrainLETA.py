@@ -391,7 +391,7 @@ def run_letagnn_training(homo_graphs, args):
 def main():
     """Run LETAGNN training across all specified datasets."""
     parser = argparse.ArgumentParser(description='LETAGNN Training with Temporal Window Attention')
-    parser.add_argument('--epochs', type=int, default=51,
+    parser.add_argument('--epochs', type=int, default=30,
                         help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')

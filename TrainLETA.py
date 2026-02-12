@@ -14,15 +14,14 @@ import warnings
 import torch.nn as nn
 import time
 
-# Optional GPU memory cap (uncomment to enable)
 # if torch.cuda.is_available():
 #     torch.cuda.set_per_process_memory_fraction(0.2)
 
 warnings.filterwarnings("ignore")
 
 from LETAGNN import (
-    set_seed, normalize_features, LETAGNN, FocalLoss, LETAGNN_NoWindow, GraphSAGE_Model,
-    split_graph_by_time_windows
+    set_seed, normalize_features, LETAGNN, FocalLoss, LETAGNN_NoWindow, LETAGNN_LightWindow,
+    GraphSAGE_Model, split_graph_by_time_windows
 )
 from torch.utils.data import DataLoader
 from torch_geometric.data import Data, Batch
@@ -51,20 +50,24 @@ def setup_logging(script_name):
 
 def collate_preprocessed_graphs(batch):
     """
-    Collate function for pre-windowed graphs.
-    Each batch item: (list_of_windows, label).
-    Returns: (window_batch, graph_window_indices, labels, num_graphs)
+    Custom collate function for pre-processed (windowed) graphs.
+    A batch item is a tuple: (list_of_windows, full_graph, label).
+    Returns full_graph_batch for global residual (reduces windowing info loss).
     """
     all_windows = [item for sublist in [b[0] for b in batch] for item in sublist]
-    labels = torch.tensor([b[1] for b in batch], dtype=torch.long)
+    labels = torch.tensor([b[2] for b in batch], dtype=torch.long)
     
+    # Create a mapping from each window back to its original graph in the batch
     graph_window_indices = []
-    for i, (windows, _) in enumerate(batch):
+    for i, (windows, _, _) in enumerate(batch):
         graph_window_indices.extend([i] * len(windows))
         
+    # Batch all windows together for efficient processing
     window_batch = Batch.from_data_list(all_windows)
+    # Full graphs for global residual (same encoder, one pass per graph)
+    full_graph_batch = Batch.from_data_list([b[1] for b in batch])
     
-    return window_batch, torch.tensor(graph_window_indices), labels, len(batch)
+    return window_batch, torch.tensor(graph_window_indices), labels, len(batch), full_graph_batch
 
 def train_model(train_loader, test_loader, model, config):
     device = config['device']
@@ -79,7 +82,7 @@ def train_model(train_loader, test_loader, model, config):
         optimizer, T_0=10, T_mult=2, eta_min=lr/20
     )
 
-    # Use provided class weights or compute from training data
+    # Check for pre-calculated weights in config, otherwise calculate them
     if 'class_weights' in config and config['class_weights'] is not None:
         class_weights = config['class_weights']
     else:
@@ -89,7 +92,7 @@ def train_model(train_loader, test_loader, model, config):
     
     history = _initialize_history()
     early_stop_counter = 0
-    best_f1 = 0
+    best_train_loss = float('inf')
     inference_time_at_best_f1 = 0
     best_model_state = None
 
@@ -102,13 +105,17 @@ def train_model(train_loader, test_loader, model, config):
         num_graphs_processed = 0
         history['lr'].append(optimizer.param_groups[0]['lr'])
 
-        for window_batch, graph_window_indices, labels, num_graphs in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False):
+        for window_batch, graph_window_indices, labels, num_graphs, full_graph_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False):
             window_batch = window_batch.to(device)
             graph_window_indices = graph_window_indices.to(device)
             labels = labels.to(device)
+            full_graph_batch = full_graph_batch.to(device)
             
             optimizer.zero_grad()
-            outputs = model(window_batch, graph_window_indices, num_graphs)
+            
+            outputs = model(window_batch, graph_window_indices, num_graphs, full_graph_batch=full_graph_batch)
+            
+            # Calculate loss and perform backpropagation
             loss = criterion(outputs, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -131,15 +138,15 @@ def train_model(train_loader, test_loader, model, config):
             history[f'train_{key}'].append(train_metrics[key])
             history[f'test_{key}'].append(test_metrics[key])
             
-        if test_metrics['f1'] > best_f1:
-            best_f1 = test_metrics['f1']
+        if avg_loss < best_train_loss:
+            best_train_loss = avg_loss
             inference_time_at_best_f1 = current_inference_time
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             early_stop_counter = 0
         else:
             early_stop_counter += 1
             
-        if epoch % 2 == 0:
+        if epoch % 5 == 0:
             logging.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Train F1={train_metrics['f1']:.4f}, Test Precision={test_metrics['precision']:.4f}, Test Recall={test_metrics['recall']:.4f}, Test F1={test_metrics['f1']:.4f}")
             
         if early_stop_counter >= patience:
@@ -164,13 +171,15 @@ def evaluate_model(model, loader, device):
     graph_idx_counter = 0
     
     with torch.no_grad():
-        for window_batch, graph_window_indices, labels, num_graphs in loader:
+        for window_batch, graph_window_indices, labels, num_graphs, full_graph_batch in loader:
             window_batch = window_batch.to(device)
             graph_window_indices = graph_window_indices.to(device)
             labels = labels.to(device)
+            full_graph_batch = full_graph_batch.to(device)
             
             start_time = time.time()
-            outputs, attn_weights = model(window_batch, graph_window_indices, num_graphs)
+            # Model now returns attention weights during eval
+            outputs, attn_weights = model(window_batch, graph_window_indices, num_graphs, full_graph_batch=full_graph_batch)
             total_inference_time += time.time() - start_time
             
             probs = F.softmax(outputs, dim=1)[:, 1]
@@ -210,7 +219,8 @@ def evaluate_model(model, loader, device):
 def _calculate_class_weights(train_loader, device, is_preprocessed=True):
     """Calculate class weights for balanced training on preprocessed data."""
     class_counts = torch.zeros(2)
-    for _, _, labels, _ in train_loader:
+    # The new loader item is (window_batch, graph_window_indices, labels, num_graphs, full_graph_batch)
+    for _, _, labels, _, _ in train_loader:
         for i in range(2):
             class_counts[i] += (labels == i).sum().item()
     
@@ -219,7 +229,7 @@ def _calculate_class_weights(train_loader, device, is_preprocessed=True):
 
 
 def _initialize_history():
-    """Initialize training history dictionary."""
+    """Initialize training history dictionary"""
     return {
         'train_loss': [], 'train_accuracy': [], 'train_precision': [], 'train_recall': [], 'train_f1': [],
         'test_accuracy': [], 'test_precision': [], 'test_recall': [], 'test_f1': [], 'lr': []
@@ -227,22 +237,24 @@ def _initialize_history():
 
 
 def run_letagnn_training(homo_graphs, args):
-    """Run LETAGNN training with 5-fold cross-validation."""
+    """Run LETAGNN training with 5-fold cross-validation"""
     set_seed(args.seed)
     device = args.device
     
-    # Normalize then window
+    # Correct Order: 1. Normalize -> 2. Window
     homo_graphs = normalize_features(homo_graphs)
 
+    # --- Pre-process all graphs into windows before training ---
     logging.info("Preprocessing all graphs into windows...")
     preprocessed_graphs = []
     for graph in tqdm(homo_graphs, desc="Windowing graphs"):
         windows = split_graph_by_time_windows(
             graph, max_windows=10, min_window_size=50
         )
-        preprocessed_graphs.append((windows, graph.y.item()))
+        # Store full graph for global residual (reduces windowing info loss)
+        preprocessed_graphs.append((windows, graph, graph.y.item()))
 
-    all_labels = [label for _, label in preprocessed_graphs]
+    all_labels = [label for _, _, label in preprocessed_graphs]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed)
     fold_results = []
 
@@ -255,20 +267,27 @@ def run_letagnn_training(homo_graphs, args):
         train_loader = DataLoader(train_data, batch_size=64, shuffle=True, num_workers=4, pin_memory=True, collate_fn=collate_preprocessed_graphs)
         test_loader = DataLoader(test_data, batch_size=64, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_preprocessed_graphs)
         
+        # Determine feature dimensions from the first window of the first graph
         first_window = preprocessed_graphs[0][0][0]
         in_channels = first_window.x.size(1)
         edge_dim = first_window.edge_attr.size(1) if first_window.edge_attr is not None else 0
         
-        model = LETAGNN(
-            in_channels=in_channels,
-            hidden_channels=128,
-            out_channels=2,
-            num_layers=2,
-            heads=4,
-            dropout=0.3,
-            window_batch_size=128,
-            edge_dim=edge_dim
-        )
+        if getattr(args, 'light_window', False):
+            model = LETAGNN_LightWindow(
+                in_channels=in_channels, hidden_channels=128, out_channels=2,
+                num_layers=2, heads=4, dropout=0.4, edge_dim=edge_dim
+            )
+        else:
+            model = LETAGNN(
+                in_channels=in_channels,
+                hidden_channels=128,
+                out_channels=2,
+                num_layers=2,
+                heads=4,
+                dropout=0.4,
+                window_batch_size=256,
+                edge_dim=edge_dim
+            )
         
         train_config = {
             'device': device,
@@ -279,14 +298,18 @@ def run_letagnn_training(homo_graphs, args):
         }
         model, history, inference_time = train_model(train_loader, test_loader, model, train_config)
         
+        # --- Save Attention Weights ---
         logging.info("Evaluating final model to get attention weights...")
         test_metrics, attention_weights = evaluate_model(model, test_loader, device)
         
+        # Map graph indices back to original addresses or use index as fallback
         for aw in attention_weights:
             original_graph_idx = test_idx[aw['graph_index']]
             try:
+                # Prefer address if it exists
                 aw['identifier'] = homo_graphs[original_graph_idx].address
             except AttributeError:
+                # Fallback to using the graph index as a unique ID
                 aw['identifier'] = f"graph_index_{original_graph_idx}"
         
         weights_save_path = f"logs/attention_weights_{args.dataset}_fold{fold+1}.pkl"
@@ -295,6 +318,12 @@ def run_letagnn_training(homo_graphs, args):
         logging.info(f"Saved attention weights for fold {fold+1} to {weights_save_path}")
         
         best_f1_epoch_idx = np.argmax(history['test_f1']) if history['test_f1'] else 0
+        # Metrics at epoch where train_loss is minimum (as in Ablation.py)
+        min_loss_idx = int(np.argmin(history['train_loss'])) if history.get('train_loss') else 0
+        p_at_min_loss = history['test_precision'][min_loss_idx] if history.get('test_precision') else 0.0
+        r_at_min_loss = history['test_recall'][min_loss_idx] if history.get('test_recall') else 0.0
+        f1_at_min_loss = history['test_f1'][min_loss_idx] if history.get('test_f1') else 0.0
+
         fold_result = {
             'fold': fold + 1,
             'best_accuracy': history['test_accuracy'][best_f1_epoch_idx],
@@ -306,12 +335,16 @@ def run_letagnn_training(homo_graphs, args):
             'final_precision': history['test_precision'][-1],
             'final_recall': history['test_recall'][-1],
             'final_f1': history['test_f1'][-1],
+            'p_at_min_loss': p_at_min_loss,
+            'r_at_min_loss': r_at_min_loss,
+            'f1_at_min_loss': f1_at_min_loss,
             'inference_time_s': inference_time,
         }
         fold_results.append(fold_result)
         logging.info(f"Fold {fold+1} Results:")
         logging.info(f"  Best Test F1 (Epoch {fold_result['best_epoch']}): {fold_result['best_f1']:.4f} (P: {fold_result['best_precision']:.4f}, R: {fold_result['best_recall']:.4f}, Acc: {fold_result['best_accuracy']:.4f})")
         logging.info(f"  Final Epoch Test F1: {fold_result['final_f1']:.4f} (P: {fold_result['final_precision']:.4f}, R: {fold_result['final_recall']:.4f}, Acc: {fold_result['final_accuracy']:.4f})")
+        logging.info(f"  @min_train_loss: P={p_at_min_loss:.4f}, R={r_at_min_loss:.4f}, F1={f1_at_min_loss:.4f}")
         
         if device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -338,12 +371,19 @@ def run_letagnn_training(homo_graphs, args):
         'std_final_test_recall': np.std([r['final_recall'] for r in fold_results]),
         'avg_final_test_accuracy': np.mean([r['final_accuracy'] for r in fold_results]),
         'std_final_test_accuracy': np.std([r['final_accuracy'] for r in fold_results]),
+        'avg_p_at_min_loss': np.mean([r['p_at_min_loss'] for r in fold_results]),
+        'std_p_at_min_loss': np.std([r['p_at_min_loss'] for r in fold_results]),
+        'avg_r_at_min_loss': np.mean([r['r_at_min_loss'] for r in fold_results]),
+        'std_r_at_min_loss': np.std([r['r_at_min_loss'] for r in fold_results]),
+        'avg_f1_at_min_loss': np.mean([r['f1_at_min_loss'] for r in fold_results]),
+        'std_f1_at_min_loss': np.std([r['f1_at_min_loss'] for r in fold_results]),
         'avg_inference_time_s': np.mean([r['inference_time_s'] for r in fold_results]),
         'std_inference_time_s': np.std([r['inference_time_s'] for r in fold_results]),
     }
     logging.info("LETAGNN Training Complete - Final Results:")
     logging.info(f"  Best Test F1:  {avg_results['avg_best_test_f1']:.4f} ± {avg_results['std_best_test_f1']:.4f} (P: {avg_results['avg_best_test_precision']:.4f}±{avg_results['std_best_test_precision']:.4f}, R: {avg_results['avg_best_test_recall']:.4f}±{avg_results['std_best_test_recall']:.4f}, Acc: {avg_results['avg_best_test_accuracy']:.4f}±{avg_results['std_best_test_accuracy']:.4f}) @ Epoch {avg_results['avg_best_epoch']:.1f}±{avg_results['std_best_epoch']:.1f}")
     logging.info(f"  Final Epoch Test F1: {avg_results['avg_final_test_f1']:.4f} ± {avg_results['std_final_test_f1']:.4f} (P: {avg_results['avg_final_test_precision']:.4f}±{avg_results['std_final_test_precision']:.4f}, R: {avg_results['avg_final_test_recall']:.4f}±{avg_results['std_final_test_recall']:.4f}, Acc: {avg_results['avg_final_test_accuracy']:.4f}±{avg_results['std_final_test_accuracy']:.4f})")
+    logging.info(f"  @min_train_loss: P={avg_results['avg_p_at_min_loss']:.4f}±{avg_results['std_p_at_min_loss']:.4f}, R={avg_results['avg_r_at_min_loss']:.4f}±{avg_results['std_r_at_min_loss']:.4f}, F1={avg_results['avg_f1_at_min_loss']:.4f}±{avg_results['std_f1_at_min_loss']:.4f}")
     
     return avg_results
 
@@ -351,22 +391,37 @@ def run_letagnn_training(homo_graphs, args):
 def main():
     """Run LETAGNN training across all specified datasets."""
     parser = argparse.ArgumentParser(description='LETAGNN Training with Temporal Window Attention')
-    parser.add_argument('--epochs', type=int, default=51, help='Number of training epochs')
-    parser.add_argument('--seed', type=int, default=24, help='Random seed')
-    parser.add_argument('--gpu', type=int, default=0, choices=[0, 1, 2, 3], help='GPU device to use')
+    parser.add_argument('--epochs', type=int, default=51,
+                        help='Number of training epochs')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+    parser.add_argument('--gpu', type=int, default=0, choices=[0, 1, 2, 3],
+                        help='GPU device number to use (0-3)')
+    parser.add_argument('--light-window', action='store_true',
+                        help='Use LETAGNN_LightWindow (main=full-graph, aux=light window+attn; speed ~= NoWindow)')
     args = parser.parse_args()
 
+    # Setup a single log file for the entire run
     setup_logging('TrainLETA')
 
-    datasets = ['2DynEth', 'Meta', 'ZipZap']
-    all_results = []
-    
+    datasets = ['Meta', 'ZipZap', '2DynEth']
+    # datasets = ['Meta']
     homo_graphs_paths = {
-        '2DynEth': "Dataset/graphs_home/homo_2DynEth_graphs.pkl",
-        'Meta': "Dataset/graphs_home/homo_Meta_graphs.pkl", 
-        'ZipZap': "Dataset/graphs_home/homo_ZipZap_graphs.pkl"
+        '2DynEth': "Dataset/PhishCombine/graphs_home_bak0201/homo_2DynEth_graphs.pkl",
+        'Meta': "Dataset/PhishCombine/graphs_home_bak0201/homo_Meta_graphs.pkl", 
+        'ZipZap': "Dataset/PhishCombine/graphs_home_bak0201/homo_ZipZap_graphs.pkl"
     }
     
+    os.makedirs('Result', exist_ok=True)
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_file = f"Result/TrainLETA_{ts}.csv"
+    out_cols = ['dataset', 'epochs', 'seed', 'gpu', 'Precision', 'Recall', 'F1-Score', 'Accuracy',
+                'P@min_train_loss', 'R@min_train_loss', 'F1@min_train_loss', 'Inference Time (ms)']
+    first_row = True
+
+    def fmt_pct(m, s):
+        return f"{m * 100:.2f}±{s * 100:.2f}"
+
     for dataset_name in datasets:
         logging.info(f"========== Processing Dataset: {dataset_name} ==========")
         current_args = argparse.Namespace(**vars(args))
@@ -377,44 +432,44 @@ def main():
         with open(homo_graphs_paths[dataset_name], 'rb') as f:
             homo_graphs = pickle.load(f)
 
-        # Keep only essential attributes
         for graph in homo_graphs:
             standard_attrs = {'x', 'edge_index', 'edge_attr', 'y', 'edge_times_normalized', 'address'}
             current_attrs = set(graph.keys())
             for attr in current_attrs - standard_attrs:
                 if hasattr(graph, attr):
                     delattr(graph, attr)
-            
             if not hasattr(graph, 'edge_times_normalized') or graph.edge_times_normalized is None:
                 graph.edge_times_normalized = torch.zeros(graph.edge_index.size(1))
 
         logging.info(f"Loaded {len(homo_graphs)} graphs for {dataset_name}")
-        
         current_args.device = device
         result = run_letagnn_training(homo_graphs, current_args)
-        
-        if result is not None:
-            all_results.append({'dataset': dataset_name, **result})
-        else:
+
+        if result is None:
             logging.error(f"Training failed for dataset {dataset_name}.")
+            continue
 
-    if all_results:
-        results_file = "logs/letagnn_results.csv"
-        df_final = pd.DataFrame(all_results)
-        
-        df_final['F1-Score'] = df_final.apply(lambda r: f"{r['avg_best_test_f1']*100:.2f}±{r['std_best_test_f1']*100:.2f}", axis=1)
-        df_final['Precision'] = df_final.apply(lambda r: f"{r['avg_best_test_precision']*100:.2f}±{r['std_best_test_precision']*100:.2f}", axis=1)
-        df_final['Recall'] = df_final.apply(lambda r: f"{r['avg_best_test_recall']*100:.2f}±{r['std_best_test_recall']*100:.2f}", axis=1)
-        df_final['Accuracy'] = df_final.apply(lambda r: f"{r['avg_best_test_accuracy']*100:.2f}±{r['std_best_test_accuracy']*100:.2f}", axis=1)
-        df_final['Inference Time (ms)'] = df_final.apply(lambda r: f"{r['avg_inference_time_s']*1000:.4f}±{r['std_inference_time_s']*1000:.4f}", axis=1)
+        row = {
+            'dataset': dataset_name, 'epochs': args.epochs, 'seed': args.seed, 'gpu': args.gpu,
+            'Precision': fmt_pct(result['avg_best_test_precision'], result['std_best_test_precision']),
+            'Recall': fmt_pct(result['avg_best_test_recall'], result['std_best_test_recall']),
+            'F1-Score': fmt_pct(result['avg_best_test_f1'], result['std_best_test_f1']),
+            'Accuracy': fmt_pct(result['avg_best_test_accuracy'], result['std_best_test_accuracy']),
+            'P@min_train_loss': fmt_pct(result['avg_p_at_min_loss'], result['std_p_at_min_loss']),
+            'R@min_train_loss': fmt_pct(result['avg_r_at_min_loss'], result['std_r_at_min_loss']),
+            'F1@min_train_loss': fmt_pct(result['avg_f1_at_min_loss'], result['std_f1_at_min_loss']),
+            'Inference Time (ms)': f"{result['avg_inference_time_s']*1000:.2f}±{result['std_inference_time_s']*1000:.2f}",
+        }
+        df_row = pd.DataFrame([row])[out_cols]
+        df_row.to_csv(results_file, mode='a' if not first_row else 'w', header=first_row, index=False)
+        first_row = False
+        logging.info(f"Appended result to {results_file}")
+        print(df_row)
 
-        final_columns = ['dataset', 'F1-Score', 'Precision', 'Recall', 'Accuracy', 'avg_best_epoch', 'Inference Time (ms)']
-        df_to_save = df_final[final_columns]
-        
-        df_to_save.sort_values(by='dataset', inplace=True)
-        df_to_save.to_csv(results_file, index=False)
-        logging.info(f"--- All LETAGNN training results saved to {results_file} ---")
-        print(df_to_save)
+    if first_row:
+        logging.warning("No results to save.")
+    else:
+        logging.info(f"Results saved to {results_file}")
 
 
 if __name__ == "__main__":

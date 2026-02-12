@@ -14,9 +14,8 @@ class DataSource:
     """
 
     def __init__(self):
-        self.apikeys = [
-            ""
-        ]
+        # TODO: set your own Etherscan API keys here, or load from environment variables.
+        self.apikeys = ["YOUR_ETHERSCAN_API_KEY"]
         self.headers = {
             "content-type": "application/json",
             "user-agent": "",
@@ -158,9 +157,11 @@ def getAddressLabelFromEthereumPage(address):
     Scrape Etherscan address page to extract label information.
     Returns (span_text, title_text, label_text).
     """
+    # NOTE: For open-source, cookies and user-agent are left as placeholders.
+    # You should set them via environment variables or a config file when running locally.
     headers = {
-        'cookie': '__stripe_mid=901553e0-d3df-4424-8b9e-fcffccc0d698055c37; etherscan_offset_datetime=+8; etherscan_cookieconsent=True; etherscan_switch_token_amount_value=value; etherscan_switch_age_datetime=Age; _ga=GA1.1.882709905.1679023127; _ga_T1JC9RNQXV=GS1.1.1739777391.69.1.1739778303.60.0.0; __cflb=02DiuFnsSsHWYH8WqVXaqSXf986r8yFDsA1zoNWuQ6RPr; ASP.NET_SessionId=r5np40os0i1h3hdlekver0ce; cf_clearance=fukKVqTem3TBD..0bzxJsuuNQ_XmGLFkdQHmGi8e3zk-1744614664-1.2.1.1-IjP9nOVD0EyQ_SWh5Zq8nUHBJDPWTo2puZ_z3_iFGwCwEeNkxOz4wLrpPtLZ4hrGdRbUNgJnhl2lBWtevi4PszUA3veNvmy7k9VtarQYwTzqkYUd5DaxWmOAWKVsmyuyTBTXRbOQ.pG.dUx8AYDlclF0xOPeHmobO1DkVtikFNFTAavZ6tC29qFKgTYd5ZTi_M1L1SvBg687ZVf6bLYRzUwnMBmNC53laUGOZhhLxVz72LFKZ4VFFTBDkMP4ot6JE3qMfs_peH0rWb3iQAxi_AXXuDyRROaaHZgf.j97KJ0vyFXyLn6zGvWX3RGIzdgX4G0gbmX79eYqsNpaEhdf59ao_vfrTensmMltqiGi6N48iWKg.7A8d39cdj2zkdNr',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+        'cookie': 'YOUR_ETHERSCAN_COOKIES_HERE',
+        'user-agent': 'YOUR_USER_AGENT_STRING_HERE',
         'origin': 'https://etherscan.io'
     }
     url_address = f'https://etherscan.io/address/{address}'
